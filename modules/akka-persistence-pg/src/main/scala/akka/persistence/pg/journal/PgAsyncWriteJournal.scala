@@ -4,19 +4,20 @@ import java.sql.BatchUpdateException
 
 import akka.actor._
 import akka.pattern._
-import akka.persistence.JournalProtocol.{RecoverySuccess, ReplayMessagesFailure}
+import akka.persistence.JournalProtocol.{ RecoverySuccess, ReplayMessagesFailure }
 import akka.persistence.journal.AsyncWriteJournal
 import akka.persistence.pg.journal.PgAsyncWriteJournal._
-import akka.persistence.pg.{EventTag, PgConfig, PgExtension}
-import akka.persistence.{AtomicWrite, PersistentRepr}
-import akka.serialization.{Serialization, SerializationExtension}
-import akka.stream.{ActorMaterializer, ActorMaterializerSettings}
-import akka.stream.scaladsl.{Keep, Sink, Source}
+import akka.persistence.pg.{ EventTag, PgConfig, PgExtension }
+import akka.persistence.{ AtomicWrite, PersistentRepr }
+import akka.serialization.{ Serialization, SerializationExtension }
+import akka.stream.{ ActorMaterializer, ActorMaterializerSettings }
+import akka.stream.scaladsl.{ Keep, Sink, Source }
 
-import scala.collection.{immutable, mutable}
-import scala.concurrent.Future
+import scala.collection.{ immutable, mutable }
+import scala.concurrent.{ Await, Future, Promise }
+import scala.concurrent.duration._
 import scala.util.control.NonFatal
-import scala.util.{Failure, Success, Try}
+import scala.util.{ Failure, Success, Try }
 
 class PgAsyncWriteJournal
   extends AsyncWriteJournal
@@ -89,25 +90,36 @@ class PgAsyncWriteJournal
   override def asyncReplayMessages(persistenceId: String, fromSequenceNr: Long, toSequenceNr: Long, max: Long)
                                   (replayCallback: (PersistentRepr) => Unit): Future[Unit] = {
 
-    log.debug("Async replay for persistenceId [{}], from sequenceNr: [{}], to sequenceNr: [{}] with max records: [{}]",
+    log.info("Async replay for persistenceId [{}], from sequenceNr: [{}], to sequenceNr: [{}] with max records: [{}]",
       persistenceId, fromSequenceNr, toSequenceNr, max)
 
-    val publisher = database.stream {
-      journals
-        .filter(_.persistenceId === persistenceId)
-        .filter(_.sequenceNr >= fromSequenceNr)
-        .filter(_.sequenceNr <= toSequenceNr)
-        .sortBy(_.sequenceNr)
-        .take(max)
-        .result
-    }
+    Future {
+      val pageSize = 10000
+      val recordsToGet = toSequenceNr - fromSequenceNr
+      val numberOfPages =  recordsToGet / pageSize
+      
+      (0 to numberOfPages.toInt).foreach { page =>
 
-    Source.fromPublisher(publisher)
-      .toMat(
-        Sink.foreach[JournalTable#TableElementType] { e =>
-          replayCallback(toPersistentRepr(e))
+        // Maths - calculate start and end seq nr for current page
+        // We need to get >= fromSequenceNr and <= toSeqenceNr. -1 accounts for this w/ > start.
+        val start = page * pageSize + fromSequenceNr - 1
+        val end = Math.min(start + pageSize, toSequenceNr) // We make sure we stop at the toSequenceNr if on the last page.
+
+        log.info(s"recovering aggregate: $persistenceId for page $page sequenceNr $start to sequenceNr $end")
+
+        // We just block the thread for recovery to ensure strong ordering. Could be improved but JDBC blocks anyway.
+        Await.result(database.run(journals
+          .filter(_.persistenceId === persistenceId)
+          .filter(_.sequenceNr > start)
+          .filter(_.sequenceNr <= end)
+          .sortBy(_.sequenceNr)
+          .result), 10 seconds).foreach { res =>
+          replayCallback(toPersistentRepr(res))
         }
-      )(Keep.right).run().map(_ => ())
+      }
+      log.info("Done paginating through database for recovery.")
+      () // Contract - Akka only cares about the completion of the future.
+    }
   }
 
   override def asyncDeleteMessagesTo(persistenceId: String, toSequenceNr: Long): Future[Unit] = {
